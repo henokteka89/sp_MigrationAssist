@@ -1,0 +1,245 @@
+CREATE OR ALTER PROCEDURE sp_MigrationAssist
+    @V NVARCHAR(20),
+    @DatabaseName SYSNAME = NULL,  -- Database name, optional
+    @AGName SYSNAME = NULL         -- Availability Group name, optional
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @CommandText NVARCHAR(MAX);
+    DECLARE @AGList NVARCHAR(MAX) = '';
+    DECLARE @AGCount INT = 0;
+    DECLARE @dbExists BIT;
+
+    -- Placeholder for database name if not supplied
+    SET @DatabaseName = ISNULL(@DatabaseName, '<DatabaseName>');
+
+    -- Check if the database exists for restore command option
+    IF @V = '1' OR UPPER(@V) = 'GENERATERESTORECOMMAND'
+    BEGIN
+        SELECT @dbExists = COUNT(*) FROM sys.databases WHERE name = @DatabaseName;
+        IF @dbExists = 0
+        BEGIN
+            PRINT 'Error: The specified database "' + @DatabaseName + '" does not exist on this server.';
+            RETURN;
+        END
+    END
+
+    -- Option 1: Generate Restore Command
+    IF @V = '1' OR UPPER(@V) = 'GENERATERESTORECOMMAND'
+    BEGIN
+        DECLARE @backup_set_id_start INT;
+        DECLARE @backup_set_id_end INT;
+        DECLARE @maxdiffbackup_set_id INT;
+        DECLARE @restoreCommand NVARCHAR(MAX);
+        DECLARE @restoreFileList NVARCHAR(MAX) = '';
+        DECLARE @logBackupExists BIT = 0;
+
+        -- Command: Set the database to SINGLE_USER mode (commented out)
+        SET @restoreCommand = 'USE master;
+-- ALTER DATABASE ' + QUOTENAME(@DatabaseName) + ' SET SINGLE_USER WITH ROLLBACK IMMEDIATE;';
+        PRINT @restoreCommand;
+
+        -- Get the latest full backup
+        SELECT @backup_set_id_start = MAX(backup_set_id)
+        FROM msdb.dbo.backupset
+        WHERE database_name = @DatabaseName 
+          AND type = 'D'
+          AND is_copy_only = 0;
+
+        -- Get the earliest full backup after the latest one
+        SELECT @backup_set_id_end = MIN(backup_set_id)
+        FROM msdb.dbo.backupset
+        WHERE database_name = @DatabaseName 
+          AND type = 'D'
+          AND backup_set_id > @backup_set_id_start
+          AND is_copy_only = 0;
+
+        IF @backup_set_id_end IS NULL 
+            SET @backup_set_id_end = 999999999;
+
+        -- Get the latest differential backup
+        SELECT @maxdiffbackup_set_id = MAX(backup_set_id)
+        FROM msdb.dbo.backupset
+        WHERE database_name = @DatabaseName 
+          AND type = 'I'
+          AND is_copy_only = 0
+          AND backup_set_id > @backup_set_id_start;
+
+        -- Full Backup Restore Command
+        DECLARE full_cursor CURSOR FOR
+        SELECT mf.physical_device_name
+        FROM msdb.dbo.backupset b
+        JOIN msdb.dbo.backupmediafamily mf ON b.media_set_id = mf.media_set_id
+        WHERE b.database_name = @DatabaseName 
+          AND b.backup_set_id = @backup_set_id_start
+          AND is_copy_only = 0;
+
+        OPEN full_cursor;
+        FETCH NEXT FROM full_cursor INTO @restoreFileList;
+
+        SET @restoreCommand = 'RESTORE DATABASE ' + QUOTENAME(@DatabaseName) + ' FROM ';
+
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            SET @restoreCommand = @restoreCommand + 'DISK = ''' + @restoreFileList + '''';
+
+            FETCH NEXT FROM full_cursor INTO @restoreFileList;
+
+            IF @@FETCH_STATUS = 0
+                SET @restoreCommand = @restoreCommand + ', ';
+        END;
+
+        CLOSE full_cursor;
+        DEALLOCATE full_cursor;
+
+        SET @restoreCommand = @restoreCommand + ' WITH NORECOVERY, MAXTRANSFERSIZE = 4194302, BUFFERCOUNT = 400;';
+        PRINT @restoreCommand;
+
+        -- Differential Backup Restore Command
+        IF @maxdiffbackup_set_id IS NOT NULL
+        BEGIN
+            DECLARE diff_cursor CURSOR FOR
+            SELECT mf.physical_device_name
+            FROM msdb.dbo.backupset b
+            JOIN msdb.dbo.backupmediafamily mf ON b.media_set_id = mf.media_set_id
+            WHERE b.database_name = @DatabaseName 
+              AND b.backup_set_id = @maxdiffbackup_set_id
+              AND b.type = 'I'
+              AND is_copy_only = 0;
+
+            OPEN diff_cursor;
+            FETCH NEXT FROM diff_cursor INTO @restoreFileList;
+
+            SET @restoreCommand = 'RESTORE DATABASE ' + QUOTENAME(@DatabaseName) + ' FROM ';
+
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                SET @restoreCommand = @restoreCommand + 'DISK = ''' + @restoreFileList + '''';
+
+                FETCH NEXT FROM diff_cursor INTO @restoreFileList;
+
+                IF @@FETCH_STATUS = 0
+                    SET @restoreCommand = @restoreCommand + ', ';
+            END;
+
+            CLOSE diff_cursor;
+            DEALLOCATE diff_cursor;
+
+            SET @restoreCommand = @restoreCommand + ' WITH NORECOVERY;';
+            PRINT @restoreCommand;
+        END;
+
+        -- Log Backup Restore Commands
+        DECLARE @backup_set_id INT;
+        DECLARE log_cursor CURSOR FOR
+        SELECT b.backup_set_id, mf.physical_device_name
+        FROM msdb.dbo.backupset b
+        JOIN msdb.dbo.backupmediafamily mf ON b.media_set_id = mf.media_set_id
+        WHERE b.database_name = @DatabaseName 
+          AND b.backup_set_id >= @backup_set_id_start 
+          AND b.backup_set_id < @backup_set_id_end
+          AND b.backup_set_id > ISNULL(@maxdiffbackup_set_id, 0)
+          AND b.type = 'L'
+          AND is_copy_only = 0;
+
+        OPEN log_cursor;
+        FETCH NEXT FROM log_cursor INTO @backup_set_id, @restoreFileList;
+
+        SET @restoreCommand = 'RESTORE LOG ' + QUOTENAME(@DatabaseName) + ' FROM ';
+
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            SET @logBackupExists = 1;
+            SET @restoreCommand = @restoreCommand + 'DISK = ''' + @restoreFileList + '''';
+
+            FETCH NEXT FROM log_cursor INTO @backup_set_id, @restoreFileList;
+
+            IF @@FETCH_STATUS = 0
+                SET @restoreCommand = @restoreCommand + ', ';
+        END;
+
+        CLOSE log_cursor;
+        DEALLOCATE log_cursor;
+
+        IF @logBackupExists = 1
+        BEGIN
+            SET @restoreCommand = @restoreCommand + ' WITH NORECOVERY;';
+            PRINT @restoreCommand;
+        END;
+
+        -- Final Recovery Command (commented out)
+        PRINT '-- RESTORE DATABASE ' + QUOTENAME(@DatabaseName) + ' WITH RECOVERY;';
+        
+        -- Optional Command: Set the database back to MULTI_USER mode (commented out)
+        PRINT '-- ALTER DATABASE ' + QUOTENAME(@DatabaseName) + ' SET MULTI_USER;';
+    END
+    -- Option 2: AG Commands
+    ELSE IF @V = '2' OR UPPER(@V) = 'AGCOMMANDS'
+    BEGIN
+        -- Attempt to identify AG name(s)
+        SELECT @AGCount = COUNT(*)
+        FROM sys.availability_groups;
+
+        IF @AGCount = 1
+        BEGIN
+            SELECT @AGName = name
+            FROM sys.availability_groups;
+        END
+        ELSE IF @AGCount > 1
+        BEGIN
+            SELECT @AGList = STRING_AGG(name, ' or ')
+            FROM sys.availability_groups;
+
+            SET @AGName = '<' + @AGList + '>';
+        END
+        ELSE
+        BEGIN
+            SET @AGName = '<AGName>';
+        END
+
+        DECLARE @AGCommands TABLE (
+            Step INT,
+            Command NVARCHAR(MAX),
+            Explanation NVARCHAR(MAX)
+        );
+
+        -- Step 1: Add database to AG on Primary Server
+        INSERT INTO @AGCommands (Step, Command, Explanation)
+        VALUES (1,
+                'ALTER AVAILABILITY GROUP [' + @AGName + '] ADD DATABASE ' + QUOTENAME(@DatabaseName) + ';',
+                'Run on Primary Replica: Adds the database to the Availability Group on the primary replica.');
+
+        -- Step 2: Join the database to AG on Secondary Server
+        INSERT INTO @AGCommands (Step, Command, Explanation)
+        VALUES (2,
+                'ALTER DATABASE ' + QUOTENAME(@DatabaseName) + ' SET HADR AVAILABILITY GROUP = [' + @AGName + '];',
+                'Run on Secondary Replica: Joins the database to the Availability Group on the secondary replica (database should be in NORECOVERY mode).');
+
+        -- Step 3: Check Database Health in the AG
+        INSERT INTO @AGCommands (Step, Command, Explanation)
+        VALUES (3,
+                'SELECT database_name, synchronization_state_desc, synchronization_health_desc FROM sys.dm_hadr_database_replica_states WHERE group_database_id = DB_ID(''' + @DatabaseName + ''');',
+                'Run on Any Replica: Checks the synchronization state and health of the database within the Availability Group.');
+
+        -- Step 4: Verify AG Health for All Replicas
+        INSERT INTO @AGCommands (Step, Command, Explanation)
+        VALUES (4,
+                'SELECT replica_server_name, ag_name, synchronization_health_desc FROM sys.dm_hadr_availability_replica_cluster_states;',
+                'Run on Any Replica: Checks the health status of all replicas in the Availability Group to ensure synchronization.');
+
+        -- Step 5: Monitor AG Connection Status
+        INSERT INTO @AGCommands (Step, Command, Explanation)
+        VALUES (5,
+                'SELECT * FROM sys.dm_hadr_connection_status WHERE ag_name = ''' + @AGName + ''';',
+                'Run on Any Replica: Monitors the connection status of replicas in the Availability Group to ensure they are all connected.');
+
+        -- Output the AG Commands Table
+        SELECT Step, Command, Explanation FROM @AGCommands ORDER BY Step;
+    END
+    ELSE
+    BEGIN
+        PRINT 'Invalid Command. Please provide a valid @V or @Command.';
+    END
+END;
+GO
