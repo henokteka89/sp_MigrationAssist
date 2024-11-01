@@ -208,38 +208,230 @@ BEGIN
         INSERT INTO @AGCommands (Step, Command, Explanation)
         VALUES (1,
                 'ALTER AVAILABILITY GROUP [' + @AGName + '] ADD DATABASE ' + QUOTENAME(@DatabaseName) + ';',
-                'Run on Primary Replica: Adds the database to the Availability Group on the primary replica.');
+                '-- Run on Primary Replica: Adds the database to the Availability Group on the primary replica.');
 
         -- Step 2: Join the database to AG on Secondary Server
         INSERT INTO @AGCommands (Step, Command, Explanation)
         VALUES (2,
                 'ALTER DATABASE ' + QUOTENAME(@DatabaseName) + ' SET HADR AVAILABILITY GROUP = [' + @AGName + '];',
-                'Run on Secondary Replica: Joins the database to the Availability Group on the secondary replica (database should be in NORECOVERY mode).');
+                '-- Run on Secondary Replica: Joins the database to the Availability Group on the secondary replica (database should be in NORECOVERY mode).');
 
         -- Step 3: Check Database Health in the AG
         INSERT INTO @AGCommands (Step, Command, Explanation)
         VALUES (3,
-                'SELECT database_name, synchronization_state_desc, synchronization_health_desc FROM sys.dm_hadr_database_replica_states WHERE group_database_id = DB_ID(''' + @DatabaseName + ''');',
-                'Run on Any Replica: Checks the synchronization state and health of the database within the Availability Group.');
+                'SELECT ag.name AS AvailabilityGroup, db.database_id AS DatabaseID, db.name AS DatabaseName, drs.synchronization_state_desc AS SyncState, ar.replica_server_name AS Replica, drs.synchronization_health_desc AS HealthStatus
+FROM
+    sys.dm_hadr_availability_group_states ags
+    JOIN sys.availability_groups ag ON ag.group_id = ags.group_id
+    JOIN sys.dm_hadr_database_replica_states drs ON ag.group_id = drs.group_id
+    JOIN sys.availability_replicas ar ON drs.replica_id = ar.replica_id
+    JOIN sys.databases db ON drs.database_id = db.database_id
+WHERE
+    db.name = ''' + @DatabaseName + '''' + ';',
+                '-- Run on Any Replica: Checks the synchronization state and health of the database within the Availability Group.');
 
         -- Step 4: Verify AG Health for All Replicas
         INSERT INTO @AGCommands (Step, Command, Explanation)
         VALUES (4,
-                'SELECT replica_server_name, ag_name, synchronization_health_desc FROM sys.dm_hadr_availability_replica_cluster_states;',
-                'Run on Any Replica: Checks the health status of all replicas in the Availability Group to ensure synchronization.');
+                'SELECT ag.name AS AvailabilityGroup, db.database_id AS DatabaseID, db.name AS DatabaseName, drs.synchronization_state_desc AS SyncState, ar.replica_server_name AS Replica, drs.synchronization_health_desc AS HealthStatus
+FROM
+    sys.dm_hadr_availability_group_states ags
+    JOIN sys.availability_groups ag ON ag.group_id = ags.group_id
+    JOIN sys.dm_hadr_database_replica_states drs ON ag.group_id = drs.group_id
+    JOIN sys.availability_replicas ar ON drs.replica_id = ar.replica_id
+    JOIN sys.databases db ON drs.database_id = db.database_id',
+                '-- Run on Any Replica: Checks the health status of all replicas in the Availability Group to ensure synchronization.');
 
         -- Step 5: Monitor AG Connection Status
         INSERT INTO @AGCommands (Step, Command, Explanation)
         VALUES (5,
-                'SELECT * FROM sys.dm_hadr_connection_status WHERE ag_name = ''' + @AGName + ''';',
-                'Run on Any Replica: Monitors the connection status of replicas in the Availability Group to ensure they are all connected.');
+                'SELECT ag.name AS AvailabilityGroup, ar.replica_server_name AS Replica, ar.endpoint_url AS EndpointURL, ars.connected_state_desc AS ConnectionStatus
+FROM
+    sys.dm_hadr_availability_group_states ags
+    JOIN sys.availability_groups ag ON ag.group_id = ags.group_id
+    JOIN sys.dm_hadr_availability_replica_states ars ON ag.group_id = ars.group_id
+    JOIN sys.availability_replicas ar ON ars.replica_id = ar.replica_id;
+',
+                '-- Run on Any Replica: Monitors the connection status of replicas in the Availability Group to ensure they are all connected.');
+-- Step 6: Checking Log Send Queue and Redo Queue
+        INSERT INTO @AGCommands (Step, Command, Explanation)
+        VALUES (6,
+                'SELECT ar.replica_server_name AS Replica,
+    drs.database_id AS DatabaseID,
+    db.name AS DatabaseName,
+    drs.log_send_queue_size AS LogSendQueue,
+    drs.redo_queue_size AS RedoQueue
+FROM
+    sys.dm_hadr_database_replica_states drs
+    JOIN sys.availability_replicas ar ON drs.replica_id = ar.replica_id
+    JOIN sys.databases db ON drs.database_id = db.database_id;'
+	,
+                '-- Run on Any Replica: Monitors the log send queue and redo queue for replicas.');
 
+-- Step 7: To view preferred owners:
+        INSERT INTO @AGCommands (Step, Command, Explanation)
+        VALUES (7,
+                'SELECT ag.name AS AvailabilityGroup,
+    ar.replica_server_name AS Replica,
+    rsr.node_name AS PreferredNode
+FROM
+    sys.availability_groups ag
+    JOIN sys.availability_replicas ar ON ag.group_id = ar.group_id
+    JOIN sys.dm_hadr_replica_states rsr ON ar.replica_id = rsr.replica_id;
+
+-- To set a preferred owner node:
+ALTER AVAILABILITY GROUP [YourAGName] MODIFY REPLICA ON ''YourReplicaServerName''
+WITH (PRIMARY_ROLE (PREFERRED_OWNER = ''YourNodeName''));'
+	,
+                '-- Run on Any Replica: Monitors the Preferred Owner Nodes.');
+-- Step 8: To Remove an Availability Group:
+        INSERT INTO @AGCommands (Step, Command, Explanation)
+        VALUES (8,
+                '--DROP AVAILABILITY GROUP [YourAGName];',
+				                '-- Run on the Primary: Removing an Availability Group.');
+
+-- Step 9: Removing a Database from an Availability Group:
+        INSERT INTO @AGCommands (Step, Command, Explanation)
+        VALUES (9,
+                '--ALTER AVAILABILITY GROUP [YourAGName] REMOVE DATABASE [YourDatabaseName];',
+				                '-- Run on the Primary: Remove a Database from an Availability Group.');
+
+-- Step 10: Join Replica to Availability Group:
+        INSERT INTO @AGCommands (Step, Command, Explanation)
+        VALUES (10,
+                '--ALTER AVAILABILITY GROUP [YourAGName] JOIN;',
+				                '-- Run on any replica: Join Replica to Availability Group.');
+
+-- Step 11: Create Availability Group:
+        INSERT INTO @AGCommands (Step, Command, Explanation)
+        VALUES (11,
+                '--CREATE AVAILABILITY GROUP [YourAGName]
+FOR DATABASE [YourDatabaseName]
+REPLICA ON
+   ''ServerName1'' WITH (
+      ENDPOINT_URL = ''TCP://ServerName1:Port'',
+      AVAILABILITY_MODE = SYNCHRONOUS_COMMIT,
+      FAILOVER_MODE = AUTOMATIC
+   ),
+   ''ServerName2'' WITH (
+      ENDPOINT_URL = ''TCP://ServerName2:Port'',
+      AVAILABILITY_MODE = SYNCHRONOUS_COMMIT,
+      FAILOVER_MODE = AUTOMATIC
+   );',
+   '-- Run on the primary: Create Availability Group.');
         -- Output the AG Commands Table
         SELECT Step, Command, Explanation FROM @AGCommands ORDER BY Step;
     END
+
+-- Option 3: Backup Jobs Management
+ELSE IF @V = '3' OR UPPER(@V) = 'BACKUPJOBS'
+BEGIN
+    -- Get a list of backup jobs with commands to disable/enable, relevant status information, and enabled/disabled status
+    DECLARE @BackupJobs TABLE (
+        JobName NVARCHAR(128),
+        IsEnabled NVARCHAR(50),
+        EnableCommand NVARCHAR(MAX),
+        DisableCommand NVARCHAR(MAX),
+        LastRunDateTime DATETIME,
+        LastRunStatus NVARCHAR(50)
+    );
+
+    INSERT INTO @BackupJobs (JobName, IsEnabled, EnableCommand, DisableCommand, LastRunDateTime, LastRunStatus)
+    SELECT 
+        j.name AS JobName,
+        CASE j.enabled
+            WHEN 1 THEN 'Enabled'
+            WHEN 0 THEN 'Disabled'
+            ELSE 'Unknown'
+        END AS IsEnabled,
+        'EXEC msdb.dbo.sp_update_job @job_name = N''' + j.name + ''', @enabled = 1' AS EnableCommand,
+        'EXEC msdb.dbo.sp_update_job @job_name = N''' + j.name + ''', @enabled = 0' AS DisableCommand,
+        COALESCE(msdb.dbo.agent_datetime(jh.run_date, jh.run_time), NULL) AS LastRunDateTime,
+        CASE COALESCE(jh.run_status, -1)
+            WHEN 1 THEN 'Succeeded'
+            WHEN 0 THEN 'Failed'
+            WHEN 3 THEN 'Cancelled'
+            WHEN 4 THEN 'In Progress'
+            WHEN -1 THEN 'Never Run'
+            ELSE 'Unknown'
+        END AS LastRunStatus
+    FROM msdb.dbo.sysjobs j
+    OUTER APPLY (
+        SELECT TOP 1 run_date, run_time, run_status
+        FROM msdb.dbo.sysjobhistory
+        WHERE job_id = j.job_id
+        ORDER BY run_date DESC, run_time DESC
+    ) AS jh
+    WHERE j.name LIKE '%backup%'  -- Filter to include only backup jobs
+    ORDER BY JobName;
+
+    -- Output the Backup Jobs Table
+    SELECT * FROM @BackupJobs;
+END
+-- Option 4: Execute sp_help_revlogin to transfer logins for a specified database
+  IF @V = '4' OR UPPER(@V) = 'REVLOGIN'
+BEGIN
+    -- Check if the database name is supplied
+    IF @DatabaseName IS NULL
+    BEGIN
+        PRINT 'Error: Please specify a database name to transfer logins.';
+        RETURN;
+    END
+
+    -- Check if the database exists
+    SELECT @dbExists = COUNT(*) FROM sys.databases WHERE name = @DatabaseName;
+    IF @dbExists = 0
+    BEGIN
+        PRINT 'Error: The specified database "' + @DatabaseName + '" does not exist on this server.';
+        RETURN;
+    END
+
+    -- Execute sp_help_revlogin to generate login transfer scripts for logins associated with the database
+    DECLARE @RevLoginCommand NVARCHAR(MAX) = 'EXEC ' + QUOTENAME(@DatabaseName) + '.dbo.sp_help_revlogin';
+    PRINT 'Executing sp_help_revlogin to generate login transfer scripts...';
+    
+    EXEC sp_executesql @RevLoginCommand;
+END
+
+
+-- Help Option
+IF @V = '0' OR UPPER(@V) = 'HELP'
+BEGIN
+    PRINT 'Stored Procedure: sp_MigrationAssist';
+    PRINT 'Description: This procedure assists with SQL Server migration tasks, including generating restore commands, managing availability groups, handling backup jobs, and transferring logins.';
+    PRINT 'Parameters:';
+    PRINT '  @V - Operation selector for different functionalities (e.g., 1 for restore, 2 for AG commands, 3 for backup job management, 4 for login transfer).';
+    PRINT '  @DatabaseName - Name of the database involved (optional for certain commands).';
+    PRINT '  @AGName - Name of the Availability Group (optional; auto-detected when possible).';
+    PRINT '';
+    PRINT 'Options for @V:';
+    PRINT '  1 or "GENERATERESTORECOMMAND" - Generates restore commands for a database, including full, differential, and log backups.';
+    PRINT '  2 or "AGCOMMANDS" - Outputs Availability Group commands for adding databases to the AG and monitoring AG health.';
+    PRINT '  3 or "BACKUPJOBS" - Lists all backup jobs with enable/disable commands, last run date, and status to prevent TLOG backups from interfering during migration.';
+    PRINT '  4 or "REVLOGIN" - Executes sp_help_revlogin to generate login transfer scripts for logins associated with the specified database.';
+    PRINT '  0 or "HELP" - Displays this help information.';
+    PRINT '';
+    PRINT 'Sample Executions:';
+    PRINT '  EXEC sp_MigrationAssist @V = ''1'', @DatabaseName = ''YourDatabase'';';
+    PRINT '    - Generates restore commands for the specified database.';
+    PRINT '';
+    PRINT '  EXEC sp_MigrationAssist @V = ''2'', @DatabaseName = ''YourDatabase'', @AGName = ''YourAGName'';';
+    PRINT '    - Generates Availability Group commands for adding the database to AG and checking AG health.';
+    PRINT '';
+    PRINT '  EXEC sp_MigrationAssist @V = ''3'';';
+    PRINT '    - Lists all backup jobs, their current enable/disable status, last run date, and provides enable/disable commands.';
+    PRINT '';
+    PRINT '  EXEC sp_MigrationAssist @V = ''4'', @DatabaseName = ''YourDatabase'';';
+    PRINT '    - Executes sp_help_revlogin to generate login transfer scripts for logins associated with the specified database.';
+    PRINT '';
+    RETURN;
+END
+
     ELSE
     BEGIN
         PRINT 'Invalid Command. Please provide a valid @V or @Command.';
     END
+
+	
 END;
 GO
